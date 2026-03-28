@@ -10,7 +10,7 @@ api_hash = "1f4ecc2133837a8a3c307f676cb95f88"
 SOURCE = "@GmailFarmerBot"
 
 # 🔥 API URL (Bot service)
-API_URL = "http://worker.railway.internal:8000"
+API_URL = "http://worker.railway.internal:8080"
 
 # 🔥 ENV sessions
 SESSION_STRINGS = [
