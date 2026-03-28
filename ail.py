@@ -1,15 +1,18 @@
 import os
 import asyncio
-from telethon import TelegramClient, events
+import requests
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 api_id = 36180474
 api_hash = "1f4ecc2133837a8a3c307f676cb95f88"
 
 SOURCE = "@GmailFarmerBot"
-BOT_USERNAME = "@gmailbuyerr_bot"
 
-# 🔥 ENV से session लो
+# 🔥 API URL (Bot service)
+API_URL = "http://worker.railway.internal:5000"
+
+# 🔥 ENV sessions
 SESSION_STRINGS = [
     os.getenv("SESSION1"),
     os.getenv("SESSION2"),
@@ -31,8 +34,9 @@ for s in SESSION_STRINGS:
     if s:
         clients.append(TelegramClient(StringSession(s), api_id, api_hash))
 
+
 # ---------------- SMART CLICK ----------------
-async def smart_click(client, msg, keyword):
+async def smart_click(msg, keyword):
     if msg.buttons:
         for row in msg.buttons:
             for btn in row:
@@ -40,6 +44,7 @@ async def smart_click(client, msg, keyword):
                     await msg.click(text=btn.text)
                     return True
     return False
+
 
 # ---------------- WAIT BUTTON ----------------
 async def wait_for_button(client, keyword, msg_id, timeout=5):
@@ -53,8 +58,11 @@ async def wait_for_button(client, keyword, msg_id, timeout=5):
         await asyncio.sleep(0.1)
     return None
 
+
 # ---------------- FETCH TASK ----------------
 async def fetch_task(client, user_id):
+
+    print("🔥 FETCH TASK:", user_id)
 
     await client.send_message(SOURCE, "➕ Register a new account")
     await asyncio.sleep(0.5)
@@ -63,35 +71,55 @@ async def fetch_task(client, user_id):
     msg_id = msg.id
 
     msg = await wait_for_button(client, "done", msg_id)
-    if not msg: return
+    if not msg:
+        print("❌ DONE not found")
+        return
 
-    await smart_click(client, msg, "done")
+    await smart_click(msg, "done")
 
     msg = await wait_for_button(client, "complete", msg_id)
-    if not msg: return
+    if not msg:
+        print("❌ COMPLETE not found")
+        return
 
-    await smart_click(client, msg, "complete")
+    await smart_click(msg, "complete")
 
     msg = await wait_for_button(client, "confirm", msg_id)
-    if not msg: return
+    if not msg:
+        print("❌ CONFIRM not found")
+        return
 
-    await smart_click(client, msg, "confirm")
+    await smart_click(msg, "confirm")
 
     await asyncio.sleep(0.3)
 
     final = await client.get_messages(SOURCE, ids=msg_id)
 
-    await client.send_message(
-        BOT_USERNAME,
-        f"AUTO|TASK|{user_id}|{final.text}"
-    )
+    print("✅ TASK GOT")
+
+    # 🔥 SEND TO BOT VIA API
+    try:
+        requests.post(
+            f"{API_URL}/task",
+            json={
+                "user_id": user_id,
+                "task": final.text
+            },
+            timeout=5
+        )
+    except Exception as e:
+        print("API ERROR:", e)
+
 
 # ---------------- DONE ----------------
 async def handle_done(client, user_id):
 
+    print("🔥 DONE CHECK:", user_id)
+
     msg = (await client.get_messages(SOURCE, limit=1))[0]
 
-    if not await smart_click(client, msg, "done"):
+    if not await smart_click(msg, "done"):
+        print("❌ Done button not found")
         return
 
     for _ in range(20):
@@ -101,18 +129,25 @@ async def handle_done(client, user_id):
         text = (updated.text or "").lower()
 
         if "how to logout" in text:
-            await client.send_message(
-                BOT_USERNAME,
-                f"AUTO|RESULT|{user_id}|SUCCESS|Task Completed"
+            requests.post(
+                f"{API_URL}/result",
+                json={
+                    "user_id": user_id,
+                    "status": "success"
+                }
             )
             return
 
         if "recovery email" in text:
-            await client.send_message(
-                BOT_USERNAME,
-                f"AUTO|RESULT|{user_id}|FAIL|Task Not Completed"
+            requests.post(
+                f"{API_URL}/result",
+                json={
+                    "user_id": user_id,
+                    "status": "fail"
+                }
             )
             return
+
 
 # ---------------- WORKER ----------------
 async def worker(client):
@@ -135,40 +170,37 @@ async def worker(client):
 
         task_queue.task_done()
 
-# ---------------- LISTENER ----------------
-async def listener(client):
 
-    @client.on(events.NewMessage)
-    async def handler(event):
-        text = event.raw_text
+# ---------------- POLL API ----------------
+async def poll_api():
 
-        if text.startswith("AUTO|FETCH|"):
-            user_id = text.split("|")[2]
+    while True:
+        try:
+            res = requests.get(f"{API_URL}/get-task", timeout=5)
+            data = res.json()
 
-            await task_queue.put({
-                "type": "fetch",
-                "user": user_id
-            })
+            if data.get("task"):
+                await task_queue.put(data["task"])
 
-        if text.startswith("AUTO|DONE|"):
-            user_id = text.split("|")[2]
+        except Exception as e:
+            print("POLL ERROR:", e)
 
-            await task_queue.put({
-                "type": "done",
-                "user": user_id
-            })
+        await asyncio.sleep(0.5)
+
 
 # ---------------- MAIN ----------------
 async def main():
 
     for c in clients:
         await c.start()
-        await listener(c)
         asyncio.create_task(worker(c))
 
-    print("🔥 MULTI USERBOT SYSTEM RUNNING")
+    asyncio.create_task(poll_api())
+
+    print("🔥 MULTI USERBOT API SYSTEM RUNNING")
 
     while True:
         await asyncio.sleep(1)
+
 
 asyncio.run(main())
