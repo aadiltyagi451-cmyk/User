@@ -10,7 +10,7 @@ api_hash = "1f4ecc2133837a8a3c307f676cb95f88"
 SOURCE = "@GmailFarmerBot"
 
 # 🔥 API URL (Bot service)
-API_URL = "http://worker.railway.internal:8080"
+API_URL = "https://worker-production-70084.up.railway.app"
 
 # 🔥 ENV sessions
 SESSION_STRINGS = [
@@ -123,7 +123,7 @@ async def handle_done(client, user_id):
         return
 
     for _ in range(20):
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(5)
 
         updated = await client.get_messages(SOURCE, ids=msg.id)
         text = (updated.text or "").lower()
