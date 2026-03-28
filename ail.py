@@ -123,7 +123,7 @@ async def handle_done(client, user_id):
         return
 
     for _ in range(20):
-        await asyncio.sleep(5)
+        await asyncio.sleep(0.5)
 
         updated = await client.get_messages(SOURCE, ids=msg.id)
         text = (updated.text or "").lower()
