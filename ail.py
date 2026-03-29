@@ -8,199 +8,264 @@ api_id = 36180474
 api_hash = "1f4ecc2133837a8a3c307f676cb95f88"
 
 SOURCE = "@GmailFarmerBot"
-
-
 API_URL = "https://worker-production-70084.up.railway.app"
 
-
 SESSION_STRINGS = [
-os.getenv("SESSION1"),
-os.getenv("SESSION2"),
-os.getenv("SESSION3"),
-os.getenv("SESSION4"),
-os.getenv("SESSION5"),
-os.getenv("SESSION6"),
-os.getenv("SESSION7"),
-os.getenv("SESSION8"),
-os.getenv("SESSION9"),
-os.getenv("SESSION10"),
+    os.getenv("SESSION1"),
+    os.getenv("SESSION2"),
+    os.getenv("SESSION3"),
+    os.getenv("SESSION4"),
+    os.getenv("SESSION5"),
+    os.getenv("SESSION6"),
+    os.getenv("SESSION7"),
+    os.getenv("SESSION8"),
+    os.getenv("SESSION9"),
+    os.getenv("SESSION10"),
 ]
 
 clients = []
-task_queue = asyncio.Queue()
-
----------------- CREATE CLIENTS ----------------
-
 for s in SESSION_STRINGS:
-if s:
-clients.append(TelegramClient(StringSession(s), api_id, api_hash))
+    if s:
+        clients.append(TelegramClient(StringSession(s), api_id, api_hash))
 
----------------- SMART CLICK ----------------
+if not clients:
+    raise RuntimeError("No sessions loaded")
 
-async def smart_click(msg, keyword):
-if msg.buttons:
-for row in msg.buttons:
-for btn in row:
-if keyword in btn.text.lower():
-await msg.click(text=btn.text)
-return True
-return False
+task_queue: asyncio.Queue = asyncio.Queue()
 
----------------- WAIT BUTTON ----------------
+# user_id -> {"msg_id": int, "client_index": int}
+USER_TASK_STATE = {}
+client_index = 0
 
-async def wait_for_button(client, keyword, msg_id, timeout=5):
-for _ in range(int(timeout / 0.1)):
-msg = await client.get_messages(SOURCE, ids=msg_id)
-if msg and msg.buttons:
-for row in msg.buttons:
-for btn in row:
-if keyword in btn.text.lower():
-return msg
-await asyncio.sleep(0.1)
-return None
 
----------------- FETCH TASK ----------------
+def get_next_client_index() -> int:
+    global client_index
+    idx = client_index % len(clients)
+    client_index += 1
+    return idx
 
-async def fetch_task(client, user_id):
 
-print("🔥 FETCH TASK:", user_id)  
+async def smart_click(msg, keyword: str) -> bool:
+    if not msg or not msg.buttons:
+        return False
 
-await client.send_message(SOURCE, "➕ Register a new account")  
-await asyncio.sleep(0.5)  
+    keyword = keyword.lower().strip()
 
-msg = (await client.get_messages(SOURCE, limit=1))[0]  
-msg_id = msg.id  
+    for row in msg.buttons:
+        for btn in row:
+            txt = (btn.text or "").lower().strip()
 
-msg = await wait_for_button(client, "done", msg_id)  
-if not msg:  
-    print("❌ DONE not found")  
-    return  
+            if keyword == "done":
+                if "done" in txt or "✔" in txt or "✓" in txt:
+                    await msg.click(text=btn.text)
+                    return True
 
-await smart_click(msg, "done")  
+            elif keyword == "complete":
+                if "complete" in txt:
+                    await msg.click(text=btn.text)
+                    return True
 
-msg = await wait_for_button(client, "complete", msg_id)  
-if not msg:  
-    print("❌ COMPLETE not found")  
-    return  
+            elif keyword == "confirm":
+                if "confirm" in txt or "click again" in txt:
+                    await msg.click(text=btn.text)
+                    return True
 
-await smart_click(msg, "complete")  
+    return False
 
-msg = await wait_for_button(client, "confirm", msg_id)  
-if not msg:  
-    print("❌ CONFIRM not found")  
-    return  
 
-await smart_click(msg, "confirm")  
+async def wait_for_button(client: TelegramClient, msg_id: int, keyword: str, timeout: float = 8.0):
+    steps = int(timeout / 0.2)
+    for _ in range(steps):
+        msg = await client.get_messages(SOURCE, ids=msg_id)
+        if msg and msg.buttons:
+            for row in msg.buttons:
+                for btn in row:
+                    txt = (btn.text or "").lower().strip()
 
-await asyncio.sleep(0.3)  
+                    if keyword == "done" and ("done" in txt or "✔" in txt or "✓" in txt):
+                        return msg
+                    if keyword == "complete" and "complete" in txt:
+                        return msg
+                    if keyword == "confirm" and ("confirm" in txt or "click again" in txt):
+                        return msg
 
-final = await client.get_messages(SOURCE, ids=msg_id)  
+        await asyncio.sleep(0.2)
 
-print("✅ TASK GOT")  
+    return None
 
-# 🔥 SEND TO BOT VIA API  
-try:  
-    requests.post(  
-        f"{API_URL}/task",  
-        json={  
-            "user_id": user_id,  
-            "task": final.text  
-        },  
-        timeout=5  
-    )  
-except Exception as e:  
-    print("API ERROR:", e)
 
----------------- DONE ----------------
+def post_result(user_id: int, success: bool):
+    try:
+        r = requests.post(
+            f"{API_URL}/result",
+            json={
+                "user_id": user_id,
+                "status": "success" if success else "fail",
+            },
+            timeout=10,
+        )
+        print("RESULT POST:", r.status_code, user_id, success)
+    except Exception as e:
+        print("RESULT POST ERROR:", e)
 
-async def handle_done(client, user_id):
 
-print("🔥 DONE CHECK:", user_id)  
+def post_task(user_id: int, task_text: str):
+    try:
+        r = requests.post(
+            f"{API_URL}/task",
+            json={
+                "user_id": user_id,
+                "task": task_text,
+            },
+            timeout=15,
+        )
+        print("TASK POST:", r.status_code, user_id)
+    except Exception as e:
+        print("TASK POST ERROR:", e)
 
-msg = (await client.get_messages(SOURCE, limit=1))[0]  
 
-if not await smart_click(msg, "done"):  
-    print("❌ Done button not found")  
-    return  
+async def fetch_task(user_id: int):
+    idx = get_next_client_index()
+    client = clients[idx]
 
-for _ in range(20):  
-    await asyncio.sleep(0.5)  
+    print("FETCH TASK:", user_id, "client:", idx)
 
-    updated = await client.get_messages(SOURCE, ids=msg.id)  
-    text = (updated.text or "").lower()  
+    await client.send_message(SOURCE, "➕ Register a new account")
+    await asyncio.sleep(0.6)
 
-    if "how to logout" in text:  
-        requests.post(  
-            f"{API_URL}/result",  
-            json={  
-                "user_id": user_id,  
-                "status": "success"  
-            }  
-        )  
-        return  
+    msg = (await client.get_messages(SOURCE, limit=1))[0]
+    msg_id = msg.id
 
-    if "recovery email" in text:  
-        requests.post(  
-            f"{API_URL}/result",  
-            json={  
-                "user_id": user_id,  
-                "status": "fail"  
-            }  
-        )  
+    msg = await wait_for_button(client, msg_id, "done")
+    if not msg:
+        print("DONE not found in fetch flow")
         return
 
----------------- WORKER ----------------
+    await smart_click(msg, "done")
 
-async def worker(client):
+    msg = await wait_for_button(client, msg_id, "complete")
+    if not msg:
+        print("COMPLETE not found")
+        return
 
-await client.start()  
-print("🔥 USERBOT READY")  
+    await smart_click(msg, "complete")
 
-while True:  
-    job = await task_queue.get()  
+    msg = await wait_for_button(client, msg_id, "confirm")
+    if not msg:
+        print("CONFIRM not found")
+        return
 
-    try:  
-        if job["type"] == "fetch":  
-            await fetch_task(client, job["user"])  
-
-        elif job["type"] == "done":  
-            await handle_done(client, job["user"])  
-
-    except Exception as e:  
-        print("ERROR:", e)  
-
-    task_queue.task_done()
-
----------------- POLL API ----------------
-
-async def poll_api():
-
-while True:  
-    try:  
-        res = requests.get(f"{API_URL}/get-task", timeout=5)  
-        data = res.json()  
-
-        if data.get("task"):  
-            await task_queue.put(data["task"])  
-
-    except Exception as e:  
-        print("POLL ERROR:", e)  
-
+    await smart_click(msg, "confirm")
     await asyncio.sleep(0.5)
 
----------------- MAIN ----------------
+    final = await client.get_messages(SOURCE, ids=msg_id)
+    if not final or not (final.text or "").strip():
+        print("FINAL TASK EMPTY")
+        return
+
+    USER_TASK_STATE[user_id] = {
+        "msg_id": msg_id,
+        "client_index": idx,
+    }
+
+    print("TASK GOT:", user_id, "msg:", msg_id)
+    post_task(user_id, final.text)
+
+
+async def handle_done(user_id: int):
+    state = USER_TASK_STATE.get(user_id)
+    if not state:
+        print("NO TASK STATE FOR USER:", user_id)
+        return
+
+    msg_id = state["msg_id"]
+    idx = state["client_index"]
+    client = clients[idx]
+
+    print("DONE CHECK:", user_id, "client:", idx, "msg:", msg_id)
+
+    msg = await client.get_messages(SOURCE, ids=msg_id)
+    if not msg:
+        print("MESSAGE NOT FOUND")
+        return
+
+    if not await smart_click(msg, "done"):
+        print("Done button not found")
+        return
+
+    print("DONE CLICKED")
+
+    for _ in range(30):
+        await asyncio.sleep(0.4)
+        updated = await client.get_messages(SOURCE, ids=msg_id)
+        text = (updated.text or "").lower()
+
+        print("CHECK:", text[:120])
+
+        if "how to logout" in text:
+            post_result(user_id, True)
+            return
+
+        if "recovery email" in text or "haven't added recovery email" in text:
+            post_result(user_id, False)
+            return
+
+    print("NO UPDATE DETECTED")
+
+
+async def worker():
+    while True:
+        job = await task_queue.get()
+        try:
+            jtype = job.get("type")
+            user_id = int(job.get("user"))
+
+            if jtype == "fetch":
+                await fetch_task(user_id)
+            elif jtype == "done":
+                await handle_done(user_id)
+            else:
+                print("UNKNOWN JOB:", job)
+
+        except Exception as e:
+            print("WORKER ERROR:", e)
+
+        task_queue.task_done()
+
+
+async def poll_api():
+    while True:
+        try:
+            r = requests.get(f"{API_URL}/get-task", timeout=15)
+            data = r.json()
+
+            if data and data.get("type") in ("fetch", "done") and data.get("user"):
+                await task_queue.put({
+                    "type": data["type"],
+                    "user": int(data["user"]),
+                })
+                print("JOB RECEIVED:", data)
+
+        except Exception as e:
+            print("POLL ERROR:", e)
+
+        await asyncio.sleep(0.5)
+
 
 async def main():
+    for i, client in enumerate(clients):
+        await client.start()
+        print("USERBOT READY:", i)
 
-for c in clients:  
-    await c.start()  
-    asyncio.create_task(worker(c))  
+    for _ in range(min(5, len(clients))):
+        asyncio.create_task(worker())
 
-asyncio.create_task(poll_api())  
+    asyncio.create_task(poll_api())
 
-print("🔥 MULTI USERBOT API SYSTEM RUNNING")  
+    print("FINAL USERBOT RUNNING")
 
-while True:  
-    await asyncio.sleep(1)
+    while True:
+        await asyncio.sleep(1)
+
 
 asyncio.run(main())
