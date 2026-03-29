@@ -9,11 +9,9 @@ api_hash = "1f4ecc2133837a8a3c307f676cb95f88"
 
 SOURCE = "@GmailFarmerBot"
 
-🔥 API URL (Bot service)
 
 API_URL = "https://worker-production-70084.up.railway.app"
 
-🔥 ENV sessions
 
 SESSION_STRINGS = [
 os.getenv("SESSION1"),
