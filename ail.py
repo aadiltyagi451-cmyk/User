@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import requests
 from telethon import TelegramClient
@@ -33,8 +34,10 @@ if not clients:
 
 task_queue: asyncio.Queue = asyncio.Queue()
 
-# user_id -> {"msg_id": int, "client_index": int}
+# user_id -> list of tasks in order
+# each item = {"task_id": str, "msg_id": int, "client_index": int, "text": str, "created_at": int}
 USER_TASK_STATE = {}
+
 client_index = 0
 
 
@@ -43,6 +46,76 @@ def get_next_client_index() -> int:
     idx = client_index % len(clients)
     client_index += 1
     return idx
+
+
+def extract_task_id(task_text: str) -> str | None:
+    if not task_text:
+        return None
+
+    m = re.search(r"Task ID:\s*`?([A-Za-z0-9_\-]+)`?", task_text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    m = re.search(r"🆔\s*Task ID:\s*`?([A-Za-z0-9_\-]+)`?", task_text, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
+def ensure_user_bucket(user_id: int):
+    if user_id not in USER_TASK_STATE:
+        USER_TASK_STATE[user_id] = []
+
+
+def add_task_state(user_id: int, task_id: str, msg_id: int, client_index_value: int, text: str):
+    ensure_user_bucket(user_id)
+
+    # duplicate task_id skip
+    for item in USER_TASK_STATE[user_id]:
+        if item["task_id"] == task_id:
+            return
+
+    USER_TASK_STATE[user_id].append({
+        "task_id": task_id,
+        "msg_id": msg_id,
+        "client_index": client_index_value,
+        "text": text,
+        "created_at": int(asyncio.get_event_loop().time()),
+    })
+
+    # safety cap
+    if len(USER_TASK_STATE[user_id]) > 10:
+        USER_TASK_STATE[user_id] = USER_TASK_STATE[user_id][-10:]
+
+
+def get_task_state(user_id: int, task_id: str | None = None):
+    tasks = USER_TASK_STATE.get(user_id, [])
+    if not tasks:
+        return None
+
+    if task_id:
+        for item in tasks:
+            if item["task_id"] == task_id:
+                return item
+        return None
+
+    # fallback oldest task
+    return tasks[0]
+
+
+def remove_task_state(user_id: int, task_id: str | None = None):
+    tasks = USER_TASK_STATE.get(user_id, [])
+    if not tasks:
+        return
+
+    if task_id:
+        USER_TASK_STATE[user_id] = [t for t in tasks if t["task_id"] != task_id]
+    else:
+        USER_TASK_STATE[user_id] = tasks[1:]
+
+    if not USER_TASK_STATE[user_id]:
+        USER_TASK_STATE.pop(user_id, None)
 
 
 async def smart_click(msg, keyword: str) -> bool:
@@ -94,32 +167,40 @@ async def wait_for_button(client: TelegramClient, msg_id: int, keyword: str, tim
     return None
 
 
-def post_result(user_id: int, success: bool):
+def post_result(user_id: int, success: bool, task_id: str | None = None):
+    payload = {
+        "user_id": user_id,
+        "status": "success" if success else "fail",
+    }
+    if task_id:
+        payload["task_id"] = task_id
+
     try:
         r = requests.post(
             f"{API_URL}/result",
-            json={
-                "user_id": user_id,
-                "status": "success" if success else "fail",
-            },
+            json=payload,
             timeout=10,
         )
-        print("RESULT POST:", r.status_code, user_id, success)
+        print("RESULT POST:", r.status_code, user_id, success, task_id)
     except Exception as e:
         print("RESULT POST ERROR:", e)
 
 
-def post_task(user_id: int, task_text: str):
+def post_task(user_id: int, task_text: str, task_id: str | None = None):
+    payload = {
+        "user_id": user_id,
+        "task": task_text,
+    }
+    if task_id:
+        payload["task_id"] = task_id
+
     try:
         r = requests.post(
             f"{API_URL}/task",
-            json={
-                "user_id": user_id,
-                "task": task_text,
-            },
+            json=payload,
             timeout=15,
         )
-        print("TASK POST:", r.status_code, user_id)
+        print("TASK POST:", r.status_code, user_id, task_id)
     except Exception as e:
         print("TASK POST ERROR:", e)
 
@@ -163,26 +244,31 @@ async def fetch_task(user_id: int):
         print("FINAL TASK EMPTY")
         return
 
-    USER_TASK_STATE[user_id] = {
-        "msg_id": msg_id,
-        "client_index": idx,
-    }
+    task_text = final.text
+    task_id = extract_task_id(task_text)
 
-    print("TASK GOT:", user_id, "msg:", msg_id)
-    post_task(user_id, final.text)
+    if not task_id:
+        # fallback unique id if bot text lacks Task ID
+        task_id = f"{user_id}_{msg_id}"
+
+    add_task_state(user_id, task_id, msg_id, idx, task_text)
+
+    print("TASK GOT:", user_id, "msg:", msg_id, "task_id:", task_id)
+    post_task(user_id, task_text, task_id)
 
 
-async def handle_done(user_id: int):
-    state = USER_TASK_STATE.get(user_id)
+async def handle_done(user_id: int, task_id: str | None = None):
+    state = get_task_state(user_id, task_id)
     if not state:
-        print("NO TASK STATE FOR USER:", user_id)
+        print("NO TASK STATE FOR USER:", user_id, "task_id:", task_id)
         return
 
     msg_id = state["msg_id"]
     idx = state["client_index"]
+    real_task_id = state["task_id"]
     client = clients[idx]
 
-    print("DONE CHECK:", user_id, "client:", idx, "msg:", msg_id)
+    print("DONE CHECK:", user_id, "client:", idx, "msg:", msg_id, "task_id:", real_task_id)
 
     msg = await client.get_messages(SOURCE, ids=msg_id)
     if not msg:
@@ -200,14 +286,15 @@ async def handle_done(user_id: int):
         updated = await client.get_messages(SOURCE, ids=msg_id)
         text = (updated.text or "").lower()
 
-        print("CHECK:", text[:120])
+        print("CHECK:", text[:160])
 
         if "how to logout" in text:
-            post_result(user_id, True)
+            post_result(user_id, True, real_task_id)
+            remove_task_state(user_id, real_task_id)
             return
 
         if "recovery email" in text or "haven't added recovery email" in text:
-            post_result(user_id, False)
+            post_result(user_id, False, real_task_id)
             return
 
     print("NO UPDATE DETECTED")
@@ -219,11 +306,12 @@ async def worker():
         try:
             jtype = job.get("type")
             user_id = int(job.get("user"))
+            task_id = job.get("task_id")
 
             if jtype == "fetch":
                 await fetch_task(user_id)
             elif jtype == "done":
-                await handle_done(user_id)
+                await handle_done(user_id, task_id)
             else:
                 print("UNKNOWN JOB:", job)
 
@@ -240,11 +328,16 @@ async def poll_api():
             data = r.json()
 
             if data and data.get("type") in ("fetch", "done") and data.get("user"):
-                await task_queue.put({
+                job = {
                     "type": data["type"],
                     "user": int(data["user"]),
-                })
-                print("JOB RECEIVED:", data)
+                }
+
+                if data.get("task_id"):
+                    job["task_id"] = str(data["task_id"])
+
+                await task_queue.put(job)
+                print("JOB RECEIVED:", job)
 
         except Exception as e:
             print("POLL ERROR:", e)
