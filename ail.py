@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import time
 import requests
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -49,10 +50,10 @@ def post_task(user_id, text, task_id, msg_id):
             "user_id": user_id,
             "task": text,
             "task_id": task_id,
-            "msg_id": msg_id   # 🔥 IMPORTANT
-        }, timeout=10)
-    except:
-        pass
+            "msg_id": msg_id
+        }, timeout=30)
+    except Exception as e:
+        print("POST TASK ERROR:", e)
 
 
 def post_result(user_id, success, task_id):
@@ -61,9 +62,9 @@ def post_result(user_id, success, task_id):
             "user_id": user_id,
             "task_id": task_id,
             "status": "success" if success else "fail"
-        }, timeout=10)
-    except:
-        pass
+        }, timeout=30)
+    except Exception as e:
+        print("POST RESULT ERROR:", e)
 
 
 async def click_button(msg, keywords):
@@ -75,8 +76,11 @@ async def click_button(msg, keywords):
             text = (btn.text or "").lower()
             for k in keywords:
                 if k in text:
-                    await msg.click(text=btn.text)
-                    return True
+                    try:
+                        await msg.click(text=btn.text)
+                        return True
+                    except:
+                        pass
     return False
 
 
@@ -86,32 +90,52 @@ async def fetch_task(user_id):
     idx, client = get_next_client()
 
     async with SESSION_LOCKS[idx]:
-        await client.send_message(SOURCE, "➕ Register a new account")
-        await asyncio.sleep(1)
+        try:
+            # 🔥 Step 1: send command
+            await client.send_message(SOURCE, "➕ Register a new account")
+            await asyncio.sleep(2)
 
-        msg = (await client.get_messages(SOURCE, limit=1))[0]
-        msg_id = msg.id
+            # 🔥 Step 2: get latest message safely
+            msgs = await client.get_messages(SOURCE, limit=1)
+            if not msgs:
+                print("No message received")
+                return
 
-        await asyncio.sleep(2)
+            msg = msgs[0]
+            msg_id = msg.id
 
-        for step in [["done"], ["complete"], ["confirm"]]:
-            msg = await client.get_messages(SOURCE, ids=msg_id)
-            await click_button(msg, step)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
-        final = await client.get_messages(SOURCE, ids=msg_id)
-        text = final.text or ""
+            # 🔥 Step 3: click buttons (if any)
+            for step in [["done"], ["complete"], ["confirm"]]:
+                msg = await client.get_messages(SOURCE, ids=msg_id)
+                await click_button(msg, step)
+                await asyncio.sleep(1)
 
-        task_id = extract_task_id(text) or f"{user_id}_{msg_id}"
+            # 🔥 Step 4: final message fetch
+            final = await client.get_messages(SOURCE, ids=msg_id)
+            text = final.text or ""
 
-        USER_TASK_STATE[user_id] = {
-            "msg_id": msg_id,
-            "client": idx,
-            "task_id": task_id,
-            "retry": 0
-        }
+            if not text:
+                print("Empty task text")
+                return
 
-        post_task(user_id, text, task_id, msg_id)
+            # 🔥 UNIQUE task id fix
+            task_id = extract_task_id(text) or f"{user_id}_{msg_id}_{int(time.time())}"
+
+            USER_TASK_STATE[user_id] = {
+                "msg_id": msg_id,
+                "client": idx,
+                "task_id": task_id,
+                "retry": 0
+            }
+
+            print("TASK FETCHED:", task_id)
+
+            post_task(user_id, text, task_id, msg_id)
+
+        except Exception as e:
+            print("FETCH ERROR:", e)
 
 
 # ================= CONFIRM AGAIN =================
@@ -124,42 +148,45 @@ async def handle_confirm(user_id, job_msg_id=None):
     idx = state["client"]
     client = clients[idx]
 
-    msg_id = job_msg_id or state["msg_id"]   # 🔥 API override support
+    msg_id = job_msg_id or state["msg_id"]
     task_id = state["task_id"]
 
     async with SESSION_LOCKS[idx]:
-        msg = await client.get_messages(SOURCE, ids=msg_id)
+        try:
+            msg = await client.get_messages(SOURCE, ids=msg_id)
 
-        # 🔥 CLICK ✓ DONE BUTTON
-        if not await click_button(msg, ["done", "✓"]):
-            await click_button(msg, ["check"])
+            if not await click_button(msg, ["done", "✓"]):
+                await click_button(msg, ["check"])
 
-        for _ in range(30):
-            await asyncio.sleep(0.7)
-            updated = await client.get_messages(SOURCE, ids=msg_id)
-            text = (updated.text or "").lower()
+            for _ in range(30):
+                await asyncio.sleep(0.7)
+                updated = await client.get_messages(SOURCE, ids=msg_id)
+                text = (updated.text or "").lower()
 
-            # ✅ SUCCESS
-            if "how to logout" in text or "done" in text:
-                post_result(user_id, True, task_id)
-                return
+                # ✅ SUCCESS
+                if "how to logout" in text or "done" in text:
+                    post_result(user_id, True, task_id)
+                    return
 
-            # ❌ FAIL → RETRY
-            if "not done" in text or "try again" in text:
-                state["retry"] += 1
+                # ❌ FAIL
+                if "not done" in text or "try again" in text:
+                    state["retry"] += 1
 
-                if state["retry"] > 2:
+                    if state["retry"] > 2:
+                        post_result(user_id, False, task_id)
+                        return
+
+                    print("RETRYING...")
+
+                    if await click_button(updated, ["retry", "again"]):
+                        await asyncio.sleep(2)
+                        return await handle_confirm(user_id, msg_id)
+
                     post_result(user_id, False, task_id)
                     return
 
-                print("RETRYING...")
-
-                if await click_button(updated, ["retry", "again"]):
-                    await asyncio.sleep(2)
-                    return await handle_confirm(user_id, msg_id)
-
-                post_result(user_id, False, task_id)
-                return
+        except Exception as e:
+            print("CONFIRM ERROR:", e)
 
 
 # ================= WORKER =================
@@ -174,11 +201,11 @@ async def worker():
             elif job["type"] == "confirm":
                 await handle_confirm(
                     job["user"],
-                    job.get("msg_id")   # 🔥 IMPORTANT
+                    job.get("msg_id")
                 )
 
         except Exception as e:
-            print("ERROR:", e)
+            print("WORKER ERROR:", e)
 
         task_queue.task_done()
 
@@ -188,12 +215,14 @@ async def worker():
 async def poll_api():
     while True:
         try:
-            r = requests.get(f"{API_URL}/get-task", timeout=10)
+            r = requests.get(f"{API_URL}/get-task", timeout=30)
             data = r.json()
+
             if data:
                 await task_queue.put(data)
-        except:
-            pass
+
+        except Exception as e:
+            print("API POLL ERROR:", e)
 
         await asyncio.sleep(1)
 
